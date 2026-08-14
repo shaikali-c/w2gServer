@@ -3,6 +3,13 @@ import type { ServerWebSocket } from "bun";
 const clients = new Map<string, ServerWebSocket>();
 const dum = new Map<ServerWebSocket, string>();
 
+const args = Bun.argv.slice(2);
+const videoPath = args[0];
+
+if (videoPath === undefined) {
+  console.error("Usage: bun server.ts <video-file>");
+  process.exit(1);
+}
 // Core synchronization states
 let currentVideoTime: number = 0; // The current video playback position in seconds
 let isPlaying: boolean = false; // Is the video currently playing?
@@ -21,13 +28,33 @@ function getLiveVideoTime(): number {
   return currentVideoTime + elapsedRealSeconds;
 }
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+};
+
 Bun.serve({
   hostname: "0.0.0.0",
   port: 8080,
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === "/ws" && server.upgrade(req)) return;
-    if (url.pathname === "/movie") return new Response(Bun.file("./ep3.mp4"));
+    // if (url.pathname === "/movie") return new Response(Bun.file(videoPath));
+    if (url.pathname === "/movie") {
+      console.log("Serving movie with CORS");
+
+      return new Response(Bun.file(videoPath), {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+        },
+      });
+    }
+    if (url.pathname === "/subtitles") return new Response(Bun.file("subtitles.vtt"), {
+      headers:corsHeaders
+    });
     return new Response("Not Found", { status: 404 });
   },
 
@@ -36,17 +63,30 @@ Bun.serve({
       console.log("Total Users Connected: ", clients.size);
     },
     message(ws, message) {
+      console.log(message);
       try {
         const msg = JSON.parse(message.toString());
 
         switch (msg.action) {
+          case "MESSAGE": {
+            const usrMessage = JSON.stringify({
+              type: "MESSAGE",
+              name: msg.name,
+              message: msg.message,
+              pic: msg.pic,
+            });
+            for (const [name, client] of clients) {
+              if (name !== msg.name) sendMessage(client, usrMessage);
+            }
+            break;
+          }
           case "JOIN": {
             clients.set(msg.name, ws);
             dum.set(ws, msg.name);
 
             // Broadcast join alert to everyone else
             const joinAlert = JSON.stringify({
-              type: "alert",
+              type: "ALERT",
               message: `${msg.name} Joined`,
               pic: msg.pic,
             });
@@ -54,11 +94,13 @@ Bun.serve({
               if (name !== msg.name) sendMessage(client, joinAlert);
             }
 
+            console.log(getLiveVideoTime());
+
             // Catch the new user up with the live room timeline and play state
             sendMessage(
               ws,
               JSON.stringify({
-                type: "sync",
+                type: "SYNC",
                 videoTime: getLiveVideoTime(),
                 isPlaying: isPlaying,
               }),
@@ -67,13 +109,12 @@ Bun.serve({
           }
 
           case "PLAY": {
-            // Save the exact timestamp when play was pressed
-            currentVideoTime = msg.timestamp;
+            currentVideoTime = getLiveVideoTime();
             isPlaying = true;
             lastRealTimeAnchor = Date.now();
 
             const response = JSON.stringify({
-              type: "PLAY",
+              action: "PLAY",
               videoTime: currentVideoTime,
             });
             for (const [name, client] of clients) {
@@ -84,16 +125,28 @@ Bun.serve({
 
           case "PAUSE": {
             // Lock the timestamp down at the paused time position
-            currentVideoTime = msg.timestamp;
+            currentVideoTime = getLiveVideoTime();
             isPlaying = false;
             lastRealTimeAnchor = Date.now();
 
             const response = JSON.stringify({
-              type: "PAUSE",
+              action: "PAUSE",
               videoTime: currentVideoTime,
             });
             for (const [name, client] of clients) {
               if (name !== msg.name) sendMessage(client, response); // Skip sender
+            }
+            break;
+          }
+
+          case "SEEK": {
+            currentVideoTime = msg.timestamp;
+            const response = JSON.stringify({
+              action: "SEEK",
+              videoTime: currentVideoTime,
+            });
+            for (const [name, client] of clients) {
+              if (name !== msg.name) sendMessage(client, response);
             }
             break;
           }
@@ -116,7 +169,9 @@ Bun.serve({
           }
           case "SERVERSYNC": {
             let clientTimestamp: number = msg.timestamp;
-            const timeDifference = Math.abs(getLiveVideoTime() - clientTimestamp);
+            const timeDifference = Math.abs(
+              getLiveVideoTime() - clientTimestamp,
+            );
             if (timeDifference >= 10) {
               const response = JSON.stringify({
                 type: "SERVERSYNC",
