@@ -10,20 +10,18 @@ if (videoPath === undefined) {
   console.error("Usage: bun server.ts <video-file>");
   process.exit(1);
 }
+
 // Core synchronization states
-let currentVideoTime: number = 0; // The current video playback position in seconds
-let isPlaying: boolean = false; // Is the video currently playing?
-let lastRealTimeAnchor: number = Date.now(); // System clock timestamp when the video state last updated
+let currentVideoTime: number = 0;
+let isPlaying: boolean = false;
+let lastRealTimeAnchor: number = Date.now();
 
 function sendMessage(sock: ServerWebSocket, msg: string) {
   sock.send(msg);
 }
 
-// Calculate the EXACT video time right now based on the system clock
 function getLiveVideoTime(): number {
   if (!isPlaying) return currentVideoTime;
-
-  // Calculate exactly how many real-world seconds passed since the last play event
   const elapsedRealSeconds = (Date.now() - lastRealTimeAnchor) / 1000;
   return currentVideoTime + elapsedRealSeconds;
 }
@@ -40,69 +38,68 @@ Bun.serve({
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === "/ws" && server.upgrade(req)) return;
-    // if (url.pathname === "/movie") return new Response(Bun.file(videoPath));
     if (url.pathname === "/movie") {
       console.log("Serving movie with CORS");
-
       return new Response(Bun.file(videoPath), {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
-        },
+        headers: corsHeaders,
       });
     }
-    if (url.pathname === "/subtitles") return new Response(Bun.file("subtitles.vtt"), {
-      headers:corsHeaders
-    });
+    if (url.pathname === "/subtitles") {
+      return new Response(Bun.file("subtitles.vtt"), {
+        headers: corsHeaders,
+      });
+    }
     return new Response("Not Found", { status: 404 });
   },
 
   websocket: {
-    open(ws) {
+    open(ws: ServerWebSocket) {
       console.log("Total Users Connected: ", clients.size);
     },
+
     message(ws, message) {
-      console.log(message);
+      console.log("Received:", message.toString());
+
       try {
         const msg = JSON.parse(message.toString());
+        const data = { msg };
 
-        switch (msg.action) {
+        switch (msg.event) {
           case "MESSAGE": {
             const usrMessage = JSON.stringify({
-              type: "MESSAGE",
-              name: msg.name,
-              message: msg.message,
-              pic: msg.pic,
+              event: "MESSAGE",
+              data: {
+                from: "them",
+                text:msg.data.text
+              },
             });
             for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, usrMessage);
+              if (name !== data.msg.data.name) sendMessage(client, usrMessage);
             }
             break;
           }
-          case "JOIN": {
-            clients.set(msg.name, ws);
-            dum.set(ws, msg.name);
 
-            // Broadcast join alert to everyone else
+          case "JOIN": {
+            const joinedName = data.msg.data.name;
+            clients.set(joinedName, ws);
+            dum.set(ws, joinedName);
+
             const joinAlert = JSON.stringify({
-              type: "ALERT",
-              message: `${msg.name} Joined`,
-              pic: msg.pic,
+              event: "JOIN",
+              data: msg.data.name,
             });
             for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, joinAlert);
+              sendMessage(client, joinAlert);
             }
 
-            console.log(getLiveVideoTime());
-
-            // Catch the new user up with the live room timeline and play state
             sendMessage(
               ws,
               JSON.stringify({
-                type: "SYNC",
-                videoTime: getLiveVideoTime(),
-                isPlaying: isPlaying,
+                event: "SYNC",
+                data: {
+                  currentTime: getLiveVideoTime(),
+                  isPlaying,
+                },
               }),
             );
             break;
@@ -114,71 +111,52 @@ Bun.serve({
             lastRealTimeAnchor = Date.now();
 
             const response = JSON.stringify({
-              action: "PLAY",
-              videoTime: currentVideoTime,
+              event: "PLAY", // Changed to sync
+              data: {},
             });
             for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, response); // Skip sender
+              if (name !== msg.data.name) sendMessage(client, response);
             }
             break;
           }
 
           case "PAUSE": {
-            // Lock the timestamp down at the paused time position
             currentVideoTime = getLiveVideoTime();
             isPlaying = false;
             lastRealTimeAnchor = Date.now();
 
             const response = JSON.stringify({
-              action: "PAUSE",
-              videoTime: currentVideoTime,
+              event: "PAUSE", // Changed to sync
+              data,
             });
             for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, response); // Skip sender
+              if (name !== msg.data.name) sendMessage(client, response);
+            }
+            break;
+          }
+          case "TYPING": {
+            const response = JSON.stringify({
+              event: "TYPING", // Changed to sync
+              data: msg.data.isTyping,
+            });
+            for (const [name, client] of clients) {
+              if (name !== msg.data.name) sendMessage(client, response);
             }
             break;
           }
 
           case "SEEK": {
-            currentVideoTime = msg.timestamp;
-            const response = JSON.stringify({
-              action: "SEEK",
-              videoTime: currentVideoTime,
-            });
-            for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, response);
-            }
-            break;
-          }
-
-          case "SYNC": {
-            // Handles timeline scrubbing/seeking
-            currentVideoTime = msg.timestamp;
+            currentVideoTime = msg.data.currentTime;
             lastRealTimeAnchor = Date.now();
-
             const response = JSON.stringify({
-              type: "SYNC",
-              videoTime: currentVideoTime,
-              isPlaying: isPlaying,
-            });
-
-            for (const [name, client] of clients) {
-              if (name !== msg.name) sendMessage(client, response); // Skip sender
-            }
-            break;
-          }
-          case "SERVERSYNC": {
-            let clientTimestamp: number = msg.timestamp;
-            const timeDifference = Math.abs(
-              getLiveVideoTime() - clientTimestamp,
-            );
-            if (timeDifference >= 10) {
-              const response = JSON.stringify({
-                type: "SERVERSYNC",
-                videoTime: currentVideoTime,
+              event: "SEEK",
+              data: {
+                currentTime: currentVideoTime,
                 isPlaying: isPlaying,
-              });
-              sendMessage(ws, response);
+              },
+            });
+            for (const [name, client] of clients) {
+              if (name !== msg.data.name) sendMessage(client, response);
             }
             break;
           }
@@ -187,6 +165,7 @@ Bun.serve({
         console.error("Payload parse error:", err);
       }
     },
+
     close(ws) {
       const name = dum.get(ws);
       if (!name) return;
@@ -195,9 +174,8 @@ Bun.serve({
       dum.delete(ws);
 
       const leaveAlert = JSON.stringify({
-        type: "ALERT",
-        action: "LEFT",
-        message: `${name} Left`,
+        event: "LEFT", // Changed to lowercase
+        data: name,
       });
       for (const client of clients.values()) {
         sendMessage(client, leaveAlert);
